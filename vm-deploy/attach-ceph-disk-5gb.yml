@@ -1,0 +1,37 @@
+---
+- name: Re-provision Ceph Storage Nodes with Thin 5GB Volumes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Target virtual machines as named in virsh list
+    target_vms:
+      - fedora44-node2
+      - fedora44-node3
+    # Target drive targets to process
+    disk_letters:
+      - b
+      - c
+      - d
+
+  tasks:
+    - name: Purge old 1GB virtual disks and attach thin 5GB volumes
+      ansible.builtin.shell:
+        cmd: |
+          # 1. Detach old block allocation if attached
+          virsh detach-disk {{ item.0 }} vd{{ item.1 }} --persistent --live 2>/dev/null || true
+          
+          # 2. Delete the physical image file safely
+          rm -f /var/lib/libvirt/images/{{ item.0 }}-vd{{ item.1 }}.img
+          
+          # 3. Create a pristine 5GB thin image (allocates 0 bytes on your host disk)
+          qemu-img create -f qcow2 /var/lib/libvirt/images/{{ item.0 }}-vd{{ item.1 }}.img 5G
+          
+          # 4. Hot-plug the thin 5GB capacity target back into the VM instance
+          virsh attach-disk {{ item.0 }} /var/lib/libvirt/images/{{ item.0 }}-vd{{ item.1 }}.img vd{{ item.1 }} \
+            --driver qemu \
+            --subdriver qcow2 \
+            --targetbus virtio \
+            --persistent \
+            --live
+      loop: "{{ target_vms | product(disk_letters) | list }}"

@@ -1,0 +1,27 @@
+---
+- name: Configure Static Hostnames for Ceph Cluster Nodes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    node_matrix:
+      - { ip: "192.168.122.216", name: "fedora44-node1" }
+      - { ip: "192.168.122.169", name: "fedora44-node2" }
+      - { ip: "192.168.122.101", name: "fedora44-node3" }
+
+  tasks:
+    - name: Apply permanent hostnames and update loopback maps
+      ansible.builtin.shell:
+        cmd: |
+          ssh -o StrictHostKeyChecking=no student@{{ item.ip }} "
+            sudo hostnamectl set-hostname {{ item.name }};
+            sudo sed -i '/127.0.0.1/s/$/ {{ item.name }}/' /etc/hosts;
+            hostname
+          "
+      loop: "{{ node_matrix }}"
+      register: hostname_outputs
+
+    - name: Print Verification Report
+      ansible.builtin.debug:
+        msg: "Node IP {{ item.item.ip }} successfully updated to hostname: {{ item.stdout }}"
+      loop: "{{ hostname_outputs.results }}"

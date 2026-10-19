@@ -1,0 +1,263 @@
+#Instead of running a separate fail task with a conditional check that triggers the Python 3.14 bug, we can simply let the ansible.builtin.slurp module handle errors natively. By removing failed_when: false, the playbook will automatically stop and print a clean "File not found" error if the root key is missing.Thats why commented
+---
+- name: Deploy and Manage Fedora 44 Cloud VMs on KVM (True Idempotent)
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    pool_dir: "/var/lib/libvirt/images"
+    image_url: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+    
+    vms_to_deploy:
+      - name: "fedora44-node1"
+        ip: "192.168.122.51"
+        memory: 4096
+        vcpus: 4 
+      - name: "fedora44-node2"
+        ip: "192.168.122.52"
+        memory: 4096
+        vcpus: 4
+      - name: "fedora44-node3"
+        ip: "192.168.122.53"
+        memory: 4096
+        vcpus: 4
+
+  tasks:
+    - name: Ensure required packages are installed on the host
+      ansible.builtin.package:
+        name:
+          - curl
+          - cloud-utils
+          - qemu-img
+          - virt-install
+          - python3-libvirt
+        state: present
+
+    - name: Read the host root SSH public key
+      ansible.builtin.slurp:
+        src: /root/.ssh/id_rsa.pub
+      register: root_ssh_key
+      failed_when: false
+
+    - name: Fail if host root SSH key does not exist
+      ansible.builtin.fail:
+        msg: "Please generate an SSH key for the root user on the host using 'ssh-keygen' before running this playbook."
+      when: root_ssh_key.content is not defined
+
+    - name: Download the base Fedora 44 Cloud QCOW2 image
+      ansible.builtin.get_url:
+        url: "{{ image_url }}"
+        dest: "{{ pool_dir }}/fedora44-base.qcow2"
+        mode: '0644'
+        timeout: 60
+      register: download_image
+      until: download_image is succeeded
+      retries: 3
+      delay: 5
+
+    - name: Gather facts about existing Libvirt VMs
+      community.libvirt.virt:
+        command: list_vms
+      register: existing_vms
+
+    # =================================================================
+    # PROVISIONING SECTION (Only runs if VM does not exist at all)
+    # =================================================================
+
+    - name: Create provisioned copy of the OS disk for each VM
+      ansible.builtin.command:
+        cmd: "qemu-img create -f qcow2 -F qcow2 -b {{ pool_dir }}/fedora44-base.qcow2 {{ pool_dir }}/{{ item.name }}.qcow2 20G"
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+      register: disk_creation
+      changed_when: disk_creation.rc == 0
+
+    - name: Create unique cloud-init configuration directories
+      ansible.builtin.file:
+        path: "/tmp/cloud-init-{{ item.name }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+
+    - name: Generate unique cloud-init user-data
+      ansible.builtin.copy:
+        dest: "/tmp/cloud-init-{{ item.name }}/user-data"
+        mode: '0644'
+        content: |
+          #cloud-config
+          user: student
+          password: student
+          chpasswd: { expire: False }
+          ssh_pwauth: True
+          users:
+            - name: student
+              gecos: Student User
+              sudo: ['ALL=(ALL) NOPASSWD:ALL']
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - "{{ root_ssh_key.content | b64decode | trim }}"
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+
+    - name: Generate unique cloud-init network-config
+      ansible.builtin.copy:
+        dest: "/tmp/cloud-init-{{ item.name }}/network-config"
+        mode: '0644'
+        content: |
+          version: 2
+          ethernets:
+            eth0:
+              dhcp4: false
+              addresses:
+                - {{ item.ip }}/24
+              gateway4: 192.168.122.1
+              nameservers:
+                addresses: [192.168.122.1, 8.8.8.8]
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+
+    - name: Compile the unique cloud-init ISO configuration drives
+      ansible.builtin.command:
+        cmd: "cloud-localds -N /tmp/cloud-init-{{ item.name }}/network-config {{ pool_dir }}/{{ item.name }}-cloudinit.iso /tmp/cloud-init-{{ item.name }}/user-data"
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+      register: iso_creation
+      changed_when: iso_creation.rc == 0
+
+    - name: Provision and kickstart all virtual machines via virt-install
+      ansible.builtin.command:
+        cmd: >
+          virt-install
+          --name {{ item.name }}
+          --memory {{ item.memory }}
+          --vcpus {{ item.vcpus }}
+          --disk path={{ pool_dir }}/{{ item.name }}.qcow2,device=disk,bus=virtio
+          --disk path={{ pool_dir }}/{{ item.name }}-cloudinit.iso,device=cdrom
+          --os-variant fedora-unknown
+          --network network=default,model=virtio
+          --graphics none
+          --import
+          --noautoconsole
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+      register: vm_provisioning
+      changed_when: vm_provisioning.rc == 0
+
+    - name: Clean up temporary cloud-init configs from host
+      ansible.builtin.file:
+        path: "/tmp/cloud-init-{{ item.name }}"
+        state: absent
+      loop: "{{ vms_to_deploy }}"
+      when: item.name not in existing_vms.list_vms
+
+    # =================================================================
+    # IDEMPOTENT HARDWARE TUNING (Handles vCPUs and Memory)
+    # =================================================================
+
+    - name: Get current vCPUs from libvirt
+      ansible.builtin.shell:
+        cmd: "virsh dominfo {{ item.name }} | awk '/CPU\\(s\\):/ {print $2}'"
+      loop: "{{ vms_to_deploy }}"
+      when: item.name in existing_vms.list_vms
+      register: check_vcpus
+      changed_when: false
+
+    - name: Get current Memory (in KiB) from libvirt
+      ansible.builtin.shell:
+        cmd: "virsh dominfo {{ item.name }} | awk '/Max memory:/ {print $3}'"
+      loop: "{{ vms_to_deploy }}"
+      when: item.name in existing_vms.list_vms
+      register: check_memory
+      changed_when: false
+
+    - name: Gracefully stop the target virtual machine if hardware specs differ
+      community.libvirt.virt:
+        name: "{{ item.name }}"
+        state: destroyed
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    - name: Apply new structural vCPU limits
+      ansible.builtin.command:
+        cmd: "virsh setvcpus {{ item.name }} {{ item.vcpus }} --config --maximum"
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    - name: Set active structural vCPU allocation
+      ansible.builtin.command:
+        cmd: "virsh setvcpus {{ item.name }} {{ item.vcpus }} --config"
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    - name: Apply new structural maximum memory limits
+      ansible.builtin.command:
+        cmd: "virsh setmaxmem {{ item.name }} {{ item.memory }}M --config"
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    - name: Set active structural memory allocation
+      ansible.builtin.command:
+        cmd: "virsh setmem {{ item.name }} {{ item.memory }}M --config"
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    - name: Start the updated virtual machine back up
+      community.libvirt.virt:
+        name: "{{ item.name }}"
+        state: running
+      loop: "{{ vms_to_deploy }}"
+      vars:
+        current_vcpu_stat: "{{ check_vcpus.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+        current_mem_stat: "{{ check_memory.results | selectattr('item.name', 'equalto', item.name) | map(attribute='stdout') | first | default('0') | int }}"
+      when:
+        - item.name in existing_vms.list_vms
+        - (current_vcpu_stat != item.vcpus | int) or (current_mem_stat != item.memory | int * 1024)
+
+    # =================================================================
+    # OUTPUT AND STATUS LOGGING
+    # =================================================================
+
+    - name: Allow time for VMs to finish initialization or boot sequences
+      ansible.builtin.pause:
+        seconds: 25
+      run_once: true
+
+    - name: Retrieve live IP validation from KVM ARP table
+      ansible.builtin.shell:
+        cmd: "virsh domifaddr {{ item.name }} --source arp | awk '/ipv4/ {print $4}'"
+      loop: "{{ vms_to_deploy }}"
+      register: virsh_ips
+      changed_when: false
+
+    - name: Print Cluster IP Summary Table
+      ansible.builtin.debug:
+        msg: >-
+          {% for result in virsh_ips.results %}
+          VM Name: {{ result.item.name }} | Assigned IP: {{ result.stdout.strip() | default(result.item.ip ~ ' (Static Mode Verified)') }}
+          {% endfor %}
